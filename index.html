@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#000">
+<title>Loading</title>
+<style>
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;background:#000;color:#f3f3f3;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;overflow:hidden}
+.loader{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px}
+.loader.hidden{display:none}
+.track{width:min(280px,70vw);height:4px;background:#222;border-radius:2px;overflow:hidden}
+.bar{width:0;height:100%;background:#fff;transition:width .15s linear}
+.status{color:#999;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;min-height:14px;text-align:center;padding:0 16px}
+.frame{display:none;position:fixed;inset:0;width:100%;height:100%;border:0;background:#000}
+.frame.ready{display:block}
+</style>
+</head>
+<body>
+<div class="loader" id="loader">
+  <div class="track"><div class="bar" id="bar"></div></div>
+  <div class="status" id="status" role="status" aria-live="polite"></div>
+</div>
+<iframe class="frame" id="frame" sandbox="allow-scripts allow-pointer-lock" allow="pointer-lock" title="Game"></iframe>
+<script>
+const W=3200,CAP=W*W,H=24,STEP=1000003,CHUNK=8*1024*1024,MAX=400*1024*1024,M=[67,83,80,51];
+const loader=document.querySelector("#loader"),bar=document.querySelector("#bar"),status=document.querySelector("#status"),frame=document.querySelector("#frame");
+
+function setProgress(p){bar.style.width=Math.max(0,Math.min(1,p))*100+"%"}
+
+async function load(){
+  const parts=new Map();
+  let expectedCount=0,totalRaw=0;
+  try{
+    for(let n=1;;n++){
+      if(expectedCount&&n>expectedCount)break;
+      const res=await fetch(n+".webp");
+      if(!res.ok)throw Error("Could not load "+n+".webp ("+res.status+").");
+      const blob=await res.blob();
+      const bitmap=await createImageBitmap(blob);
+      if(bitmap.width!==W||bitmap.height!==W){
+        const d=bitmap.width+" × "+bitmap.height;bitmap.close();
+        throw Error(n+".webp is "+d+", expected "+W+" × "+W+".");
+      }
+      const canvas=document.createElement("canvas");
+      canvas.width=W;canvas.height=W;
+      const ctx=canvas.getContext("2d",{willReadFrequently:true});
+      ctx.drawImage(bitmap,0,0);bitmap.close();
+      const rgba=ctx.getImageData(0,0,W,W).data;
+      const header=readAlpha(rgba,H);
+      if(!M.every((v,i)=>header[i]===v))throw Error("No ColorScript data found in "+n+".webp.");
+      const view=new DataView(header.buffer);
+      const index=view.getUint32(4,false),count=view.getUint32(8,false),
+            rawLength=view.getUint32(12,false),compressedLength=view.getUint32(16,false),
+            expectedChecksum=view.getUint32(20,false);
+      if(!count||count>50||index>=count||rawLength>CHUNK||compressedLength>CAP-H)throw Error(n+".webp has invalid data.");
+      if(expectedCount&&count!==expectedCount)throw Error("Parts belong to different files.");
+      expectedCount=count;
+      if(parts.has(index))throw Error("Duplicate part "+(index+1)+".");
+      const packet=readAlpha(rgba,H+compressedLength);
+      const stream=new Blob([packet.subarray(H)]).stream().pipeThrough(new DecompressionStream("gzip"));
+      const raw=new Uint8Array(await new Response(stream).arrayBuffer());
+      if(raw.length!==rawLength||checksum(raw)!==expectedChecksum)throw Error("Part "+n+" failed its integrity check.");
+      parts.set(index,raw);
+      totalRaw+=raw.length;
+      if(totalRaw>MAX)throw Error("Restored HTML exceeds 400 MB.");
+      canvas.width=0;canvas.height=0;
+      setProgress(parts.size/expectedCount);
+    }
+    const ordered=[];
+    for(let i=0;i<expectedCount;i++){
+      if(!parts.has(i))throw Error("Missing part "+(i+1)+".");
+      ordered.push(parts.get(i));
+    }
+    const url=URL.createObjectURL(new Blob(ordered,{type:"text/html;charset=utf-8"}));
+    setProgress(1);
+    frame.src=url;
+    frame.classList.add("ready");
+    loader.classList.add("hidden");
+  }catch(error){
+    status.textContent=error instanceof Error?error.message:"Could not load.";
+  }
+}
+
+function readAlpha(rgba,count){const bytes=new Uint8Array(count);for(let i=0;i<count;i++)bytes[i]=rgba[((i*STEP)%CAP)*4+3];return bytes}
+function checksum(bytes){let hash=0x811c9dc5;for(const byte of bytes){hash^=byte;hash=Math.imul(hash,0x01000193)}return hash>>>0}
+
+load();
+</script>
+</body>
+</html>
