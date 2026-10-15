@@ -22,32 +22,45 @@ html,body{width:100%;height:100%;margin:0;background:#000;color:#f3f3f3;font-fam
 <script>
 (async()=>{
 const W=3200,CAP=W*W,H=24,STEP=1000003,CHUNK=8*1024*1024,MAX=400*1024*1024,M=[67,83,80,51];
-const DL=6,DEC=2; // concurrent downloads / concurrent decodes
+const DL=3; // parallel download workers (decode itself is serialized)
 const bar=document.getElementById("bar"),statusEl=document.getElementById("status");
 
-const readAlpha=(rgba,count)=>{const bytes=new Uint8Array(count);for(let i=0;i<count;i++)bytes[i]=rgba[((i*STEP)%CAP)*4+3];return bytes};
-const checksum=bytes=>{let hash=0x811c9dc5;for(const byte of bytes){hash^=byte;hash=Math.imul(hash,0x01000193)}return hash>>>0};
+// read `count` alpha bytes starting at logical offset `start`
+const readAlpha=(rgba,start,count)=>{
+  const out=new Uint8Array(count);
+  for(let i=0;i<count;i++)out[i]=rgba[(((start+i)*STEP)%CAP)*4+3];
+  return out;
+};
+const checksum=bytes=>{
+  let h=0x811c9dc5;
+  for(let i=0;i<bytes.length;i++){h^=bytes[i];h=Math.imul(h,0x01000193)}
+  return h>>>0;
+};
 
-const sem=limit=>{let active=0;const q=[];const next=()=>{if(active<limit&&q.length){active++;q.shift()()}};
-  return async fn=>{await new Promise(r=>{q.push(r);next()});try{return await fn()}finally{active--;next()}}};
-const dlSlot=sem(DL),decSlot=sem(DEC);
+// one decode at a time: each decode peaks at ~80-120 MB of pixel memory
+let decodeChain=Promise.resolve();
+const decodeLock=fn=>{
+  const run=decodeChain.then(fn,fn);
+  decodeChain=run.catch(()=>{});
+  return run;
+};
 
-let expectedCount=0,totalRaw=0,downloaded=0,decoded=0;
-const parts=new Map();
+let expectedCount=0,totalRaw=0,downloaded=0,decoded=0,failed=false;
+const parts=new Map(); // index -> Blob (browser-managed, can spill to disk; NOT JS heap)
 const setProgress=()=>{
   const total=expectedCount||1;
   bar.style.width=Math.min(1,(downloaded*0.5+decoded*0.5)/total)*100+"%";
 };
 
-const download=n=>dlSlot(async()=>{
+const download=async n=>{
   const res=await fetch(n+".webp");
   if(!res.ok)throw Error("Could not load "+n+".webp ("+res.status+").");
   const blob=await res.blob();
   downloaded++;setProgress();
   return blob;
-});
+};
 
-const decode=(blob,n)=>decSlot(async()=>{
+const decode=(blob,n)=>decodeLock(async()=>{
   const bitmap=await createImageBitmap(blob);
   if(bitmap.width!==W||bitmap.height!==W){
     const d=bitmap.width+" × "+bitmap.height;bitmap.close();
@@ -57,8 +70,9 @@ const decode=(blob,n)=>decSlot(async()=>{
   canvas.width=W;canvas.height=W;
   const ctx=canvas.getContext("2d",{willReadFrequently:true});
   ctx.drawImage(bitmap,0,0);bitmap.close();
-  const rgba=ctx.getImageData(0,0,W,W).data;
-  const header=readAlpha(rgba,H);
+  let rgba=ctx.getImageData(0,0,W,W).data;
+
+  const header=readAlpha(rgba,0,H);
   if(!M.every((v,i)=>header[i]===v))throw Error("No ColorScript data found in "+n+".webp.");
   const view=new DataView(header.buffer);
   const index=view.getUint32(4,false),count=view.getUint32(8,false),
@@ -66,19 +80,24 @@ const decode=(blob,n)=>decSlot(async()=>{
         expectedChecksum=view.getUint32(20,false);
   if(!count||count>50||index>=count||rawLength>CHUNK||compressedLength>CAP-H)throw Error(n+".webp has invalid data.");
   if(expectedCount&&count!==expectedCount)throw Error("Parts belong to different files.");
-  const packet=readAlpha(rgba,H+compressedLength);
-  const stream=new Blob([packet.subarray(H)]).stream().pipeThrough(new DecompressionStream("gzip"));
+
+  const packet=readAlpha(rgba,H,compressedLength);
+
+  // free the big pixel buffers BEFORE decompressing
+  rgba=null;
+  canvas.width=0;canvas.height=0;
+
+  const stream=new Blob([packet]).stream().pipeThrough(new DecompressionStream("gzip"));
   const raw=new Uint8Array(await new Response(stream).arrayBuffer());
   if(raw.length!==rawLength||checksum(raw)!==expectedChecksum)throw Error("Part "+n+" failed its integrity check.");
-  canvas.width=0;canvas.height=0;
   return{index,count,raw};
 });
 
 const store=({index,raw})=>{
   if(parts.has(index))throw Error("Duplicate part "+(index+1)+".");
-  parts.set(index,raw);
   totalRaw+=raw.length;
   if(totalRaw>MAX)throw Error("Restored HTML exceeds 400 MB.");
+  parts.set(index,new Blob([raw])); // move out of JS heap right away
   decoded++;setProgress();
 };
 
@@ -86,26 +105,46 @@ try{
   const first=await decode(await download(1),1);
   expectedCount=first.count;
   store(first);
-  const jobs=[];
-  for(let n=2;n<=expectedCount;n++){
-    jobs.push(download(n).then(blob=>decode(blob,n)).then(store));
-  }
-  await Promise.all(jobs);
+
+  let next=2;
+  const worker=async()=>{
+    while(!failed){
+      const n=next++;
+      if(n>expectedCount)return;
+      try{store(await decode(await download(n),n))}
+      catch(e){failed=true;throw e}
+    }
+  };
+  await Promise.all(Array.from({length:Math.min(DL,expectedCount-1)},worker));
 
   for(let i=0;i<expectedCount;i++)if(!parts.has(i))throw Error("Missing part "+(i+1)+".");
   bar.style.width="100%";
 }catch(error){
+  failed=true;
   statusEl.textContent=error instanceof Error?error.message:"Could not load.";
   return;
 }
 
-const dec=new TextDecoder("utf-8");
-document.open();
-for(let i=0;i<expectedCount;i++){
-  document.write(dec.decode(parts.get(i),{stream:i<expectedCount-1}));
-  parts.delete(i);
-}
-document.close();
+// Stitch Blobs together (no copy, no giant JS string) and let the browser
+// stream-parse the page from the blob URL instead of document.write()-ing 300 MB.
+statusEl.textContent="Launching…";
+
+// Keep relative URLs (XHR/fetch/img/audio) resolving against the real folder,
+// like they did when the page was document.write()-n in place.
+try{
+  const first=parts.get(0);
+  const head=await first.slice(0,65536).text();
+  const m=/<head[^>]*>/i.exec(head)||/<html[^>]*>/i.exec(head);
+  if(m&&!/<base[\s>]/i.test(head)){
+    const at=new TextEncoder().encode(head.slice(0,m.index+m[0].length)).length;
+    const tag='<base href="'+new URL(".",location.href).href+'">';
+    parts.set(0,new Blob([first.slice(0,at),tag,first.slice(at)]));
+  }
+}catch(e){}
+
+const html=new Blob(Array.from({length:expectedCount},(_,i)=>parts.get(i)),{type:"text/html;charset=utf-8"});
+parts.clear();
+location.replace(URL.createObjectURL(html));
 })();
 </script>
 </body>
